@@ -5,3 +5,11 @@
   language: script
   pass_filenames: false
   always_run: true
+- id: comment-budget-write
+  name: comment budget (lower to current count)
+  description: Rewrite .comment-budget to the current count; refuses to raise it.
+  entry: comment_budget.py --write
+  language: script
+  pass_filenames: false
+  always_run: true
+  stages: [manual]

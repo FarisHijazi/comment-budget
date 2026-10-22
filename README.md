@@ -17,10 +17,15 @@ Ruff's `ERA` and `FIX` rules catch commented-out code and TODOs. This hook caps 
 ```yaml
 repos:
   - repo: https://github.com/FarisHijazi/comment-budget
-    rev: v1.0.0
+    rev: v1.1.0
     hooks:
       - id: comment-budget
+      - id: comment-budget-write # manual stage only
 ```
+
+`pre-commit run comment-budget-write --hook-stage manual` lowers `.comment-budget` to the current count after you delete comments. Commit the file it writes.
+
+Running the script directly:
 
 ```sh
 ./comment_budget.py --write               # create .comment-budget at today's count, then commit it
