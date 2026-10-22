@@ -1,0 +1,7 @@
+- id: comment-budget
+  name: comment budget
+  description: Fail when the repo's comment-line count exceeds the integer in .comment-budget.
+  entry: comment_budget.py
+  language: script
+  pass_filenames: false
+  always_run: true
