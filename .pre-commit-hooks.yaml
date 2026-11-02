@@ -1,13 +1,13 @@
 - id: comment-budget
   name: comment budget
-  description: Fail when the repo's comment-line count exceeds the integer in .comment-budget.
+  description: Fail when comment lines or total lines exceed the per-glob budgets in .budgets.toml (or flags, or a legacy .comment-budget).
   entry: comment_budget.py
   language: script
   pass_filenames: false
   always_run: true
 - id: comment-budget-write
-  name: comment budget (lower to current count)
-  description: Rewrite .comment-budget to the current count; refuses to raise it.
+  name: comment budget (lower budgets to today's values)
+  description: Lower every budget in the config file to today's value; refuses to raise one.
   entry: comment_budget.py --write
   language: script
   pass_filenames: false

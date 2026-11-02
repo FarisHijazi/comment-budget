@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Ratchet the number of comment lines in a repo: it may only go down.
+"""Ratchet comment lines and total lines per glob: budgets may only go down.
 
-Counts full-line comments in tracked source files and compares the total to
-`.comment-budget`, which holds a count (`412`), a percentage of code lines
-(`4.5%`; code = non-blank lines that are not counted comments) with optional
-absolute bounds (`4.5% min=50 max=6000`: up to 50 always pass, over 6000 always
-fail, the percentage decides in between), or `off` to disable the check. Paths matching `.comment-budget-ignore`
-(gitignore-style globs) are skipped. Docstrings and trailing comments after
-code are never counted; neither are shebangs, encoding lines, lint/type-checker
-pragmas, or a license header at the top of a JS/TS file.
+Budgets live in `.budgets.toml` (or are passed as flags), one table per metric, keyed by glob:
 
-    comment_budget.py               check: fail if count > budget
-    comment_budget.py --list        per-file counts, highest first
-    comment_budget.py --write       lower the budget to the current count
-    comment_budget.py --write --force-raise   raise it (loudly)
+    [comment_budget]                # full-line comments; <!-- --> in Markdown
+    "**/*.py" = "2% max=32"        # % of the matched files' code lines
+    [line_budget]                   # every line, summed over the matched files
+    "**/*.md" = "30%"              # % of the repo's (non-Markdown) code lines
+    "docs/devlog/**" = "off"
+
+A value is N, P%, 'P% min=N max=M' (min always passes, max always fails, % decides
+between) or off. Each file belongs to the LAST glob that matches it, so a later `off`
+carves files out of an earlier entry. A legacy `.comment-budget` file (one value)
+still works and covers the original source files. `.comment-budget-ignore`
+(gitignore-style) drops paths from every metric. Docstrings, trailing comments,
+shebangs, encoding lines, lint pragmas and JS/TS license headers never count.
+
+    comment_budget.py                           check
+    comment_budget.py --list                    every budget with its files
+    comment_budget.py --write                   lower budgets to today's values
+    comment_budget.py --write --force-raise     raise them (loudly)
+    comment_budget.py --comment-budget '**/*.py=2%' --line-budget '**/*.md=24000'
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ import sys
 import tokenize
 from pathlib import Path
 
+CONFIG_FILE = ".budgets.toml"
 BUDGET_FILE = ".comment-budget"
 IGNORE_FILE = ".comment-budget-ignore"
 TOP_N = 10
@@ -34,10 +42,12 @@ TOP_N = 10
 PY_EXT = {".py"}
 JS_EXT = {".ts", ".tsx", ".js", ".jsx"}
 HASH_EXT = {".yml", ".yaml", ".sh", ".toml"}
+MD_EXT = {".md"}
 
 PY_PRAGMA = re.compile(r"#+\s*(noqa\b|type:\s*ignore|pragma:|ruff:|pylint:|fmt:|isort:|mypy:|pyright:)")
 PY_ENCODING = re.compile(r"^[ \t\f]*#.*?coding[:=]")
 JS_DIRECTIVE = re.compile(r"^(//+|/\*+)\s*(eslint|prettier-|@ts-|ts-|<reference\b)")
+MD_PRAGMA = re.compile(r"<!--\s*(markdownlint|prettier-ignore|toc\b|/?toc\b|vale\b|cspell)", re.IGNORECASE)
 LICENSE = re.compile(r"licen[cs]e|copyright|spdx-", re.IGNORECASE)
 
 
@@ -112,6 +122,24 @@ def count_js(text: str) -> int:
     return len(comments)
 
 
+def count_markdown(text: str) -> int:
+    """Lines that start inside or at an HTML comment, outside fenced code blocks."""
+    count, fence, in_comment = 0, None, False
+    for line in text.splitlines():
+        s = line.strip()
+        if not in_comment and re.match(r"^(```|~~~)", s):
+            fence = None if fence and s.startswith(fence) else (fence or s[:3])
+            continue
+        if fence:
+            continue
+        starts = in_comment or s.startswith("<!--")
+        if starts and not (not in_comment and MD_PRAGMA.match(s)):
+            count += 1
+        if starts or "<!--" in s:
+            in_comment = s.rfind("<!--") > s.rfind("-->") if "<!--" in s else in_comment and "-->" not in s
+    return count
+
+
 def count_file(path: str, text: str) -> int:
     ext = Path(path).suffix.lower()
     if ext in PY_EXT:
@@ -120,6 +148,8 @@ def count_file(path: str, text: str) -> int:
         return count_js(text)
     if ext in HASH_EXT:
         return count_hash(text)
+    if ext in MD_EXT:
+        return count_markdown(text)
     return 0
 
 
@@ -158,37 +188,38 @@ def code_lines(text: str, comments: int) -> int:
     return max(0, sum(1 for ln in text.splitlines() if ln.strip()) - comments)
 
 
-def count_repo(root: Path) -> dict[str, tuple[int, int]]:
-    patterns = read_ignore(root)
-    exts = PY_EXT | JS_EXT | HASH_EXT
-    counts: dict[str, tuple[int, int]] = {}
-    for path in tracked_files(root):
-        if Path(path).suffix.lower() not in exts or is_ignored(path, patterns):
-            continue
-        f = root / path
-        if not f.is_file():
-            continue
-        text = f.read_text(encoding="utf-8", errors="replace")
-        n = count_file(path, text)
-        counts[path] = (n, code_lines(text, n))
-    return counts
-
-
-def ranked(counts: dict[str, tuple[int, int]]) -> list[tuple[str, int]]:
-    return sorted(((p, n) for p, (n, _) in counts.items() if n), key=lambda kv: (-kv[1], kv[0]))
-
-
 class Budget:
-    """Allowed comment lines = clamp(percent of code lines, floor, cap).
+    """Allowed amount = clamp(percent of base, floor, cap); `off` disables the entry.
 
     `cap` (max=N, or a bare N) always fails above it; `floor` (min=N) always passes at or
     below it; between the two the percentage (kept in hundredths) decides.
     """
 
-    def __init__(self, cap: int | None = None, hundredths: int | None = None, floor: int | None = None):
-        self.cap, self.hundredths, self.floor = cap, hundredths, floor
+    def __init__(self, cap: int | None = None, hundredths: int | None = None, floor: int | None = None, off: bool = False):
+        self.cap, self.hundredths, self.floor, self.off = cap, hundredths, floor, off
+
+    @classmethod
+    def parse(cls, raw: str) -> Budget:
+        tokens = raw.split()
+        if tokens == [OFF]:
+            return cls(off=True)
+        fields: dict[str, str] = {}
+        for tok in tokens:
+            key = "pct" if tok.endswith("%") else tok.split("=", 1)[0] if "=" in tok else "max"
+            if key not in ("pct", "min", "max") or key in fields:
+                raise ValueError(raw)
+            fields[key] = tok.rstrip("%").split("=", 1)[-1]
+        if not fields or ("min" in fields and "pct" not in fields):
+            raise ValueError(raw)
+        return cls(
+            int(fields["max"]) if "max" in fields else None,
+            round(float(fields["pct"]) * 100) if "pct" in fields else None,
+            int(fields["min"]) if "min" in fields else None,
+        )
 
     def __str__(self) -> str:
+        if self.off:
+            return OFF
         if self.hundredths is None and self.floor is None:
             return str(self.cap)
         parts = [] if self.hundredths is None else [f"{self.hundredths / 100:g}%"]
@@ -196,124 +227,232 @@ class Budget:
         parts += [] if self.cap is None else [f"max={self.cap}"]
         return " ".join(parts)
 
-    def lowered(self, comments: int, code: int, cap: bool, percent: bool) -> Budget:
-        hundredths = -(-comments * 10000 // code) if code else 0
-        return Budget(comments if cap else None, hundredths if percent else None, self.floor)
+    def lowered(self, amount: int, base: int, cap: bool | None = None, percent: bool | None = None) -> Budget:
+        if self.off:
+            return self
+        cap = self.cap is not None if cap is None else cap
+        percent = self.hundredths is not None if percent is None else percent
+        hundredths = -(-amount * 10000 // base) if base else 0
+        return Budget(amount if cap else None, hundredths if percent else None, self.floor)
 
-    def exceeded(self, comments: int, code: int) -> bool:
-        if self.cap is not None and comments > self.cap:
-            return True
-        if self.hundredths is None or (self.floor is not None and comments <= self.floor):
+    def exceeded(self, amount: int, base: int) -> bool:
+        if self.off:
             return False
-        return comments * 10000 > self.hundredths * code
+        if self.cap is not None and amount > self.cap:
+            return True
+        if self.hundredths is None or (self.floor is not None and amount <= self.floor):
+            return False
+        return amount * 10000 > self.hundredths * base
 
-    def under(self, comments: int, code: int) -> bool:
-        now = self.lowered(comments, code, True, True)
-        return (self.cap is not None and comments < self.cap) or (
+    def under(self, amount: int, base: int) -> bool:
+        if self.off:
+            return False
+        now = self.lowered(amount, base, True, True)
+        return (self.cap is not None and amount < self.cap) or (
             self.hundredths is not None and now.hundredths < self.hundredths
         )
 
 
 OFF = "off"
+METRICS = ("comment_budget", "line_budget")
+LEGACY_GLOB = "**/*.{py,ts,tsx,js,jsx,yml,yaml,sh,toml}"
+ENTRY = re.compile(r'^(\s*"((?:[^"\\]|\\.)*)"\s*=\s*")([^"]*)(".*)$')
 
 
-def read_budget(root: Path) -> Budget | str | None:
-    f = root / BUDGET_FILE
-    if not f.is_file():
-        return None
-    raw = f.read_text().split()
-    if raw == [OFF]:
-        return OFF
-    fields: dict[str, str] = {}
-    for tok in raw:
-        key = "pct" if tok.endswith("%") else tok.split("=", 1)[0] if "=" in tok else "max"
-        if key not in ("pct", "min", "max") or key in fields:
-            fields = {}
-            break
-        fields[key] = tok.rstrip("%").split("=", 1)[-1]
+def glob_regex(pattern: str) -> re.Pattern[str]:
+    """Full-path glob: `**/` any directories, `*` within one segment, `?`, `{a,b}`."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif pattern.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif pattern[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif pattern[i] == "?":
+            out, i = out + "[^/]", i + 1
+        elif pattern[i] == "{" and "}" in pattern[i:]:
+            j = pattern.index("}", i)
+            out, i = out + "(?:" + "|".join(re.escape(p) for p in pattern[i + 1 : j].split(",")) + ")", j + 1
+        else:
+            out, i = out + re.escape(pattern[i]), i + 1
+    return re.compile(out + r"\Z")
+
+
+def assign(paths: list[str], globs: list[str]) -> dict[str, list[str]]:
+    """Each path belongs to the LAST glob that matches it (like .gitignore / CODEOWNERS)."""
+    compiled = [(g, glob_regex(g)) for g in globs]
+    owned: dict[str, list[str]] = {g: [] for g in globs}
+    for path in paths:
+        owner = next((g for g, rx in reversed(compiled) if rx.match(path)), None)
+        if owner is not None:
+            owned[owner].append(path)
+    return owned
+
+
+def parse_flag(raw: str) -> tuple[str, Budget]:
+    glob, sep, value = raw.partition("=")
+    if not sep or not glob:
+        sys.exit(f"comment-budget: expected GLOB=VALUE, got {raw!r}")
+    return glob, parse_value(value, raw)
+
+
+def parse_value(value: str, where: str) -> Budget:
     try:
-        if not fields or ("min" in fields and "pct" not in fields):
-            raise ValueError
-        return Budget(
-            int(fields["max"]) if "max" in fields else None,
-            round(float(fields["pct"]) * 100) if "pct" in fields else None,
-            int(fields["min"]) if "min" in fields else None,
-        )
+        return Budget.parse(value)
     except ValueError:
         sys.exit(
-            f"comment-budget: {BUDGET_FILE} must hold a count (412), a percentage with optional "
-            f"absolute bounds (4.5% min=50 max=6000) or {OFF}, got {raw!r}"
+            f"comment-budget: bad budget {value!r} in {where}: use N, P%, 'P% min=N max=M' or {OFF}"
         )
 
 
-def write_budget(root: Path, budget: Budget | None, new: Budget, raising: bool, force_raise: bool) -> int:
+def load_config(root: Path, args: argparse.Namespace) -> tuple[dict[str, dict[str, Budget]], Path | None]:
+    """Budgets per metric per glob, and the file they came from (None = CLI flags)."""
+    if args.comment_budget or args.line_budget:
+        return {
+            "comment_budget": dict(parse_flag(r) for r in args.comment_budget),
+            "line_budget": dict(parse_flag(r) for r in args.line_budget),
+        }, None
+    toml_file = root / CONFIG_FILE
+    if toml_file.is_file():
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            sys.exit(f"comment-budget: {CONFIG_FILE} needs python3 >= 3.11 (tomllib); use flags or {BUDGET_FILE}.")
+        data = tomllib.loads(toml_file.read_text())
+        unknown = set(data) - set(METRICS)
+        if unknown:
+            sys.exit(f"comment-budget: unknown table(s) {sorted(unknown)} in {CONFIG_FILE}; use {METRICS}")
+        return {m: {g: parse_value(str(v), f"{CONFIG_FILE} [{m}] {g!r}") for g, v in data.get(m, {}).items()} for m in METRICS}, toml_file
+    legacy = root / BUDGET_FILE
+    if legacy.is_file():
+        raw = legacy.read_text().strip()
+        return {"comment_budget": {LEGACY_GLOB: parse_value(raw, BUDGET_FILE)}, "line_budget": {}}, legacy
+    return {"comment_budget": {}, "line_budget": {}}, None
+
+
+def measure(root: Path) -> dict[str, tuple[int, int, int]]:
+    """path -> (comment lines, code lines, total lines) for every tracked, non-ignored file."""
+    patterns = read_ignore(root)
+    out: dict[str, tuple[int, int, int]] = {}
+    for path in tracked_files(root):
+        f = root / path
+        if is_ignored(path, patterns) or not f.is_file():
+            continue
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        n = count_file(path, text)
+        out[path] = (n, code_lines(text, n) if counted(path) else 0, len(text.splitlines()))
+    return out
+
+
+def counted(path: str) -> bool:
+    return Path(path).suffix.lower() in PY_EXT | JS_EXT | HASH_EXT | MD_EXT
+
+
+def evaluate(config: dict[str, dict[str, Budget]], stats: dict[str, tuple[int, int, int]]):
+    """Yield (metric, glob, budget, amount, base, files) for every entry."""
+    repo_code = sum(c for p, (_, c, _) in stats.items() if Path(p).suffix.lower() not in MD_EXT)
+    for metric in METRICS:
+        entries = config[metric]
+        paths = [p for p in stats if metric == "line_budget" or counted(p)]
+        for glob, files in assign(paths, list(entries)).items():
+            if metric == "comment_budget":
+                amount = sum(stats[p][0] for p in files)
+                base = sum(stats[p][1] for p in files)
+            else:
+                amount = sum(stats[p][2] for p in files)
+                base = repo_code
+            yield metric, glob, entries[glob], amount, base, files
+
+
+def rewrite_toml(text: str, new: dict[tuple[str, str], Budget]) -> str:
+    """Replace only the values of known entries, keeping order, comments and layout."""
+    table, out = None, []
+    for line in text.splitlines(keepends=True):
+        header = re.match(r"^\s*\[([^\]]+)\]", line)
+        if header:
+            table = header.group(1).strip()
+        m = ENTRY.match(line.rstrip("\n"))
+        if m and (table, m.group(2)) in new:
+            line = f"{m.group(1)}{new[(table, m.group(2))]}{m.group(4)}" + ("\n" if line.endswith("\n") else "")
+        out.append(line)
+    return "".join(out)
+
+
+def write(source: Path, results: list, force_raise: bool) -> int:
+    raising = [r for r in results if r[2].exceeded(r[3], r[4])]
+    if raising and not force_raise:
+        for metric, glob, budget, amount, base, _ in raising:
+            print(f"comment-budget: refusing to RAISE {metric} {glob!r}: {budget} -> {budget.lowered(amount, base)}.")
+        print("The budget only goes down; delete lines instead, or pass --force-raise if this is deliberate.")
+        return 1
     if raising:
-        if not force_raise:
-            print(
-                f"comment-budget: refusing to RAISE the budget {budget} -> {new}. "
-                "The budget only goes down; delete comments instead, "
-                "or pass --force-raise if this is deliberate."
-            )
-            return 1
         print("!" * 72)
-        print(f"!!! comment-budget: RAISING the budget {budget} -> {new} !!!")
-        print("!!! This loosens the ratchet for everyone; say why in the commit message.  !!!")
+        print("!!! comment-budget: RAISING budgets; say why in the commit message. !!!")
         print("!" * 72)
-    (root / BUDGET_FILE).write_text(f"{new}\n")
-    print(f"comment-budget: wrote {BUDGET_FILE} = {new} (was {budget or 'unset'}). Commit it.")
+    new = {(m, g): b.lowered(a, base) for m, g, b, a, base, _ in results}
+    if source.name == BUDGET_FILE:
+        source.write_text(f"{new[('comment_budget', LEGACY_GLOB)]}\n")
+    else:
+        source.write_text(rewrite_toml(source.read_text(), new))
+    for (m, g), b in new.items():
+        print(f"comment-budget: {m} {g!r} = {b}")
+    print(f"comment-budget: wrote {source.name}. Commit it.")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--list", action="store_true", help="print per-file comment-line counts")
-    ap.add_argument("--write", action="store_true", help=f"lower {BUDGET_FILE} to the current value")
-    ap.add_argument("--percent", action="store_true", help="with --write, set the percentage (keeps min=; with --count also max=)")
-    ap.add_argument("--count", action="store_true", help="with --write, set the absolute max (with --percent: both)")
-    ap.add_argument("--force-raise", action="store_true", help="with --write, allow raising the budget")
+    ap.add_argument("--comment-budget", action="append", default=[], metavar="GLOB=VALUE",
+                    help="comment-line budget for a glob (repeatable; replaces the config file)")
+    ap.add_argument("--line-budget", action="append", default=[], metavar="GLOB=VALUE",
+                    help="total-line budget for a glob (repeatable; replaces the config file)")
+    ap.add_argument("--list", action="store_true", help="print every budget with its top files")
+    ap.add_argument("--write", action="store_true", help="lower every budget in the config file to today's value")
+    ap.add_argument("--force-raise", action="store_true", help="with --write, allow raising a budget")
     ap.add_argument("--root", type=Path, default=Path("."), help="repo root (default: cwd)")
     args = ap.parse_args(argv)
 
     root = args.root.resolve()
-    counts = count_repo(root)
-    comments = sum(n for n, _ in counts.values())
-    code = sum(c for _, c in counts.values())
-    ratio = f"{Budget().lowered(comments, code, False, True).hundredths / 100:g}%"
-    budget = read_budget(root)
+    config, source = load_config(root, args)
+    if args.write and source is None and not (args.comment_budget or args.line_budget):
+        (root / CONFIG_FILE).write_text('[comment_budget]\n"**" = "0"\n')
+        config, source = load_config(root, args)
+        args.force_raise = True
+    if not any(config.values()):
+        print(f"comment-budget: no budgets. Add {CONFIG_FILE} (or {BUDGET_FILE}, or --comment-budget/--line-budget flags).")
+        return 1
+    stats = measure(root)
+    results = list(evaluate(config, stats))
 
-    if args.list:
-        for path, n in ranked(counts):
-            print(f"{n:6d}  {path}")
-        print(f"{comments:6d}  TOTAL comment lines, {code} code lines ({ratio}) (budget {budget or 'unset'})")
-        return 0
-    if budget == OFF and not (args.write and (args.count or args.percent)):
-        print(f"comment-budget: disabled ({BUDGET_FILE} says {OFF}). {comments} comment lines / {code} code lines ({ratio}).")
-        return 0
     if args.write:
-        known = isinstance(budget, Budget)
-        if args.count or args.percent:
-            cap, percent = args.count, args.percent
-        elif known:
-            cap, percent = budget.cap is not None, budget.hundredths is not None
-        else:
-            cap, percent = True, False
-        new = (budget if known else Budget()).lowered(comments, code, cap, percent)
-        raising = known and budget.exceeded(comments, code)
-        return write_budget(root, budget, new, raising, args.force_raise)
-    if budget is None:
-        print(f"comment-budget: no {BUDGET_FILE} file. Run this script with --write (or --write --percent).")
-        return 1
-    summary = f"{comments} comment lines / {code} code lines ({ratio})"
-    if budget.exceeded(comments, code):
-        print(f"comment-budget: FAILED - {summary}, budget is {budget}.")
-        print("Remove comments that restate the code. Top files by comment lines:")
-        for path, n in ranked(counts)[:TOP_N]:
-            print(f"{n:6d}  {path}")
-        return 1
-    print(f"comment-budget: {summary}, budget {budget}.")
-    if budget.under(comments, code):
-        print("Under budget: run with --write to lock in the lower number.")
-    return 0
+        if source is None:
+            sys.exit("comment-budget: --write needs a config file; budgets given as flags are edited by hand.")
+        return write(source, results, args.force_raise)
+
+    failed = False
+    for metric, glob, budget, amount, base, files in results:
+        unit = "comment lines" if metric == "comment_budget" else "lines"
+        ratio = f"{(amount * 100 / base if base else 0):.2f}% of {base} code lines"
+        if budget.off:
+            print(f"  off   {metric} {glob!r}: {amount} {unit} ({ratio})")
+            continue
+        over = budget.exceeded(amount, base)
+        failed |= over
+        print(f"  {'FAIL' if over else 'ok':4}  {metric} {glob!r}: {amount} {unit} ({ratio}), budget {budget}")
+        if over or args.list:
+            col = 0 if metric == "comment_budget" else 2
+            top = sorted(((stats[p][col], p) for p in files if stats[p][col]), reverse=True)
+            for n, p in top[: None if args.list else TOP_N]:
+                print(f"        {n:6d}  {p}")
+        elif budget.under(amount, base) and source is not None:
+            print("        under budget: run with --write to lock in the lower number")
+    if failed:
+        print("comment-budget: FAILED. Delete lines that restate the code or the docs.")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
