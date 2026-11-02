@@ -337,7 +337,7 @@ def measure(root: Path) -> dict[str, tuple[int, int, int]]:
     out: dict[str, tuple[int, int, int]] = {}
     for path in tracked_files(root):
         f = root / path
-        if is_ignored(path, patterns) or not f.is_file():
+        if path == CONFIG_FILE or is_ignored(path, patterns) or not f.is_file():
             continue
         try:
             text = f.read_text(encoding="utf-8")

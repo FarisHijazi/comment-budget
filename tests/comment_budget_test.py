@@ -165,3 +165,11 @@ def test_brace_and_star_globs(tmp_path):
     root = repo(tmp_path, {"a.ts": "// c\n", "b.js": "// d\n", "c.py": "# e\n"})
     out = run(root, "--comment-budget", "**/*.{ts,js}=2", "--comment-budget", "*.py=1").stdout
     assert "'**/*.{ts,js}': 2 comment lines" in out and "'*.py': 1 comment lines" in out
+
+
+def test_config_file_itself_is_not_counted(tmp_path):
+    root = repo(tmp_path, {
+        "a.py": "# c\n",
+        ".budgets.toml": '# header comment\n# another\n[comment_budget]\n"**" = "1"\n',
+    })
+    assert run(root).returncode == 0
