@@ -43,11 +43,15 @@ PY_EXT = {".py"}
 JS_EXT = {".ts", ".tsx", ".js", ".jsx"}
 HASH_EXT = {".yml", ".yaml", ".sh", ".toml"}
 MD_EXT = {".md"}
+HCL_EXT = {".tf", ".tfvars", ".hcl"}
+J2_EXT = {".j2"}
 
 PY_PRAGMA = re.compile(r"#+\s*(noqa\b|type:\s*ignore|pragma:|ruff:|pylint:|fmt:|isort:|mypy:|pyright:)")
 PY_ENCODING = re.compile(r"^[ \t\f]*#.*?coding[:=]")
 JS_DIRECTIVE = re.compile(r"^(//+|/\*+)\s*(eslint|prettier-|@ts-|ts-|<reference\b)")
 MD_PRAGMA = re.compile(r"<!--\s*(markdownlint|prettier-ignore|toc\b|/?toc\b|vale\b|cspell)", re.IGNORECASE)
+HCL_PRAGMA = re.compile(r"(#|//)\s*(tflint-ignore|checkov:skip|tfsec:ignore|trivy:ignore)")
+HEREDOC = re.compile(r"<<-?([A-Za-z_][\w-]*)")
 LICENSE = re.compile(r"licen[cs]e|copyright|spdx-", re.IGNORECASE)
 
 
@@ -140,6 +144,66 @@ def count_markdown(text: str) -> int:
     return count
 
 
+def hcl_line_opens(s: str) -> tuple[str | None, bool]:
+    """(heredoc marker, unclosed /*) that a code line opens outside its strings."""
+    heredoc, quote, i = None, False, 0
+    while i < len(s):
+        if quote:
+            if s[i] == "\\":
+                i += 1
+            elif s[i] == '"':
+                quote = False
+        elif s[i] == '"':
+            quote = True
+        elif s.startswith(("#", "//"), i):
+            break
+        elif s.startswith("/*", i):
+            end = s.find("*/", i + 2)
+            if end < 0:
+                return heredoc, True
+            i = end + 1
+        elif m := HEREDOC.match(s, i):
+            heredoc, i = m.group(1), m.end() - 1
+        i += 1
+    return heredoc, False
+
+
+def count_hcl(text: str) -> int:
+    """Full-line #, // and /* */ comments in HCL, outside heredocs."""
+    count, heredoc, in_block = 0, None, False
+    for line in text.splitlines():
+        s = line.strip()
+        if heredoc:
+            heredoc = None if s == heredoc else heredoc
+        elif in_block:
+            count += 1
+            in_block = "*/" not in s
+        elif s.startswith(("#", "//")):
+            count += not HCL_PRAGMA.match(s)
+        elif s.startswith("/*"):
+            count += 1
+            in_block = "*/" not in s[2:]
+        else:
+            heredoc, in_block = hcl_line_opens(s)
+    return count
+
+
+def count_jinja(path: str, text: str) -> int:
+    """Lines inside {# #}, plus the rendered language's comments (`#` when it is not a known one)."""
+    lines = text.splitlines()
+    rows, inside = set(), False
+    for i, line in enumerate(lines):
+        s = line.strip()
+        starts = inside or s.startswith("{#")
+        if starts:
+            rows.add(i)
+        if starts or "{#" in s:
+            inside = s.rfind("{#") > s.rfind("#}") if "{#" in s else "#}" not in s
+    rest = "\n".join(line for i, line in enumerate(lines) if i not in rows)
+    inner = path[: -len(".j2")]
+    return len(rows) + (count_file(inner, rest) if counted(inner) else count_hash(rest))
+
+
 def count_file(path: str, text: str) -> int:
     ext = Path(path).suffix.lower()
     if ext in PY_EXT:
@@ -150,6 +214,10 @@ def count_file(path: str, text: str) -> int:
         return count_hash(text)
     if ext in MD_EXT:
         return count_markdown(text)
+    if ext in HCL_EXT:
+        return count_hcl(text)
+    if ext in J2_EXT:
+        return count_jinja(path, text)
     return 0
 
 
@@ -349,7 +417,7 @@ def measure(root: Path) -> dict[str, tuple[int, int, int]]:
 
 
 def counted(path: str) -> bool:
-    return Path(path).suffix.lower() in PY_EXT | JS_EXT | HASH_EXT | MD_EXT
+    return Path(path).suffix.lower() in PY_EXT | JS_EXT | HASH_EXT | MD_EXT | HCL_EXT | J2_EXT
 
 
 def evaluate(config: dict[str, dict[str, Budget]], stats: dict[str, tuple[int, int, int]]):

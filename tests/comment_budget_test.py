@@ -173,3 +173,64 @@ def test_config_file_itself_is_not_counted(tmp_path):
         ".budgets.toml": '# header comment\n# another\n[comment_budget]\n"**" = "1"\n',
     })
     assert run(root).returncode == 0
+
+
+def comments(root: Path, glob: str) -> str:
+    return run(root, "--comment-budget", f"{glob}=0").stdout
+
+
+def test_hcl_comments_skip_strings_heredocs_and_pragmas(tmp_path):
+    tf = (
+        "# one\n"
+        "// two\n"
+        "/* three\n"
+        "   four */\n"
+        'resource "x" "y" {\n'
+        '  name = "# not a comment // nor this /* nor this"\n'
+        '  esc  = "a \\" <<NOPE"\n'
+        "  body = <<-EOT\n"
+        "    # inside a heredoc\n"
+        "    /* still inside\n"
+        "    EOT\n"
+        "  tag = 1 # trailing\n"
+        "  x = 2 /* opens a block\n"
+        "  five */\n"
+        "}\n"
+        "# tflint-ignore: terraform_unused_declarations\n"
+        "#checkov:skip=CKV_X_1\n"
+    )
+    root = repo(tmp_path, {"main.tf": tf, "a.tfvars": "# six\nx = 1\n", "t.tftest.hcl": "// seven\nrun \"a\" {}\n"})
+    out = comments(root, "**/*.{tf,tfvars,hcl}")
+    assert "7 comment lines" in out and "of 14 code lines" in out
+
+
+def test_hcl_heredoc_ends_only_at_its_marker(tmp_path):
+    tf = 'a = <<EOT\n# in\nEOTX\n# still in\nEOT\n# out\n'
+    root = repo(tmp_path, {"main.tf": tf})
+    assert "1 comment lines" in comments(root, "**/*.tf")
+
+
+def test_jinja_comments_and_inner_language(tmp_path):
+    root = repo(tmp_path, {
+        "run.sh.j2": "#!/bin/sh\n{# one #}\n# two\necho {{ x }}  # trailing\n{#\n  three\n  four\n#}\n",
+        "first.sh.j2": "{# one #}\n#!/bin/bash\n# two\necho hi\n",
+        "app.yml.j2": "# one\nkey: {{ v }} {# trailing #}\n{% if x %}\n# two\n{% endif %}\n",
+        "x.conf.j2": "# one\nlisten 80;\n",
+        "page.md.j2": "<!-- one -->\n# Title, not a comment\n",
+    })
+    for glob, n, code in [
+        ("run.sh.j2", 6, 2), ("first.sh.j2", 2, 2), ("app.yml.j2", 2, 3), ("x.conf.j2", 1, 1), ("page.md.j2", 1, 1),
+    ]:
+        assert f"{n} comment lines ({0 if not code else n * 100 / code:.2f}% of {code} code lines)" in comments(root, glob), glob
+
+
+def test_new_languages_ratchet(tmp_path):
+    root = repo(tmp_path, {
+        "main.tf": "# c\nx = 1\n",
+        "a.sh.j2": "{# c #}\necho\n",
+        ".budgets.toml": '[comment_budget]\n"**/*.tf" = "100%"\n"**/*.j2" = "100%"\n',
+    })
+    assert run(root, "--write").returncode == 0
+    assert '"**/*.tf" = "100%"' in budgets(root) and '"**/*.j2" = "100%"' in budgets(root)
+    (root / "main.tf").write_text("# c\n# d\nx = 1\n")
+    assert run(root).returncode == 1
