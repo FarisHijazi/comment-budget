@@ -33,12 +33,17 @@ Globs match the full repo-relative path: `**/` is any number of directories, `*`
 
 ### What counts as a comment
 
-Full-line comments in `.py`, `.ts`, `.tsx`, `.js`, `.jsx`, `.yml`, `.yaml`, `.sh`, `.toml`, and `<!-- -->` lines in `.md`. These don't count:
+Full-line comments in `.py`, `.ts`, `.tsx`, `.js`, `.jsx`, `.yml`, `.yaml`, `.sh`, `.toml`, `<!-- -->` lines in `.md`, and in:
+
+- OpenTofu/Terraform `.tf`, `.tfvars`, `.hcl` (including `.tftest.hcl`): `#`, `//` and `/* */` lines, never inside strings or heredocs.
+- Jinja `.j2`: lines inside `{# #}`, plus the rendered file's own comments by its inner extension (`foo.sh.j2` counts like `.sh`, `foo.yml.j2` like `.yml`). An unknown inner extension (`foo.conf.j2`, `foo.service.j2`) counts `#` lines.
+
+These don't count:
 
 - docstrings
 - comments after code on the same line
 - shebangs and encoding lines
-- lint and type-checker pragmas (`# noqa`, `// eslint-…`, `// @ts-…`, `<!-- markdownlint-… -->`, `<!-- prettier-ignore -->`, …)
+- lint and type-checker pragmas (`# noqa`, `// eslint-…`, `// @ts-…`, `<!-- markdownlint-… -->`, `<!-- prettier-ignore -->`, `# tflint-ignore`, `#checkov:skip`, `#tfsec:ignore`, `#trivy:ignore`, …)
 - a license header at the top of a JS/TS file
 - HTML comments inside fenced code blocks in Markdown
 
@@ -59,7 +64,7 @@ Ruff's `ERA` and `FIX` rules catch commented-out code and TODOs. This hook caps 
 ```yaml
 repos:
   - repo: https://github.com/FarisHijazi/comment-budget
-    rev: v2.0.0
+    rev: v2.1.0
     hooks:
       - id: comment-budget
       - id: comment-budget-write # manual stage only
